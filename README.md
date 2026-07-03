@@ -28,7 +28,7 @@ Lighting is never touched, since it barely affects performance to begin with.
 
 ## Installation
 
-Subscribe via the [Steam Workshop page](#) or drop this folder into:
+Subscribe via the [Steam Workshop page](https://steamcommunity.com/sharedfiles/filedetails/?id=3757004198) or drop this folder into:
 ```
 People Playground/Mods/PPGPerformanceSuite/
 ```
