@@ -1,0 +1,19 @@
+{
+  "Name": "PPG Performance Suite",
+  "Author": "BeamngDriveAddict",
+  "Description": "Makes the game run smoother during big builds and heavy combat without changing how anything looks or plays. Fixes tracers/bullet effects disappearing during heavy fire, auto-cleans piles of debris and blood/scorch marks so they don't tank your FPS over long sessions, and makes bullets only do expensive collision checks when something's actually nearby. Damage, range, and speed are untouched. Note: disabling in the menu takes effect after a full game restart (PPG limitation, not this mod).",
+  "ModVersion": "1.0",
+  "GameVersion": "1.27.12",
+  "ThumbnailPath": "",
+  "EntryPoint": "PPGPerformanceSuite.Mod",
+  "Tags": [
+    "Performance"
+  ],
+  "Scripts": [
+    "script.cs"
+  ],
+  "Active": true,
+  "UGCIdentity": null,
+  "CreatorUGCIdentity": null,
+  "AssemblyName": null
+}
