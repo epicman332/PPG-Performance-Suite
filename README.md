@@ -45,5 +45,4 @@ See [LICENSE](LICENSE). Modding/personal use is welcome — redistribution of al
 
 ## Requirements
 
-- Weapon size affects its power (Mod)
-- Catt's Cannons
+None!
