@@ -43,6 +43,14 @@ namespace PPGPerformanceSuite
             bootstrap.AddComponent<WelcomePopup>();
             bootstrap.AddComponent<AudioSafetyCap>();
 
+            // EXPERIMENTAL - testing whether allowing jointed/welded
+            // contraptions to sleep too (not just loose debris) helps or
+            // hurts. If anything looks wrong (stretchy welds, stuff not
+            // waking up properly), just comment out this one line and
+            // restart the game to fully revert - nothing else in the
+            // suite depends on this.
+            bootstrap.AddComponent<IdleRigidbodySleeper>();
+
             ModAPI.Notify("PPG Performance Suite loaded");
         }
 
@@ -304,6 +312,12 @@ namespace PPGPerformanceSuite
         private const int MaxDebrisPiecesStrained = 60; // tighter cap when Auto Optimizer detects strain
         private const float ScanInterval = 0.3f;
 
+        // How slow something needs to be moving before we consider it
+        // "settled enough" to force asleep early while off-screen. Loose
+        // enough to catch debris that's basically done bouncing, tight
+        // enough that nothing still actively flying gets frozen mid-arc.
+        private const float SleepVelocityThreshold = 0.05f;
+
         private readonly Queue<DebrisComponent> tracked = new Queue<DebrisComponent>();
         private readonly HashSet<DebrisComponent> trackedSet = new HashSet<DebrisComponent>();
 
@@ -344,6 +358,47 @@ namespace PPGPerformanceSuite
                 tracked.Dequeue();
             }
 
+            // Real GPU load reduction: while a piece of debris is
+            // off-screen, there's no reason to pay its draw call at all -
+            // disable the renderer entirely rather than just leaving it
+            // rendering into empty space outside the camera. The instant
+            // it's back in view, the renderer flips back on with zero
+            // visible pop since nothing about its transform/physics
+            // changed while hidden.
+            //
+            // Collider/rigidbody sleeping: if a piece is BOTH off-screen
+            // AND has settled to a near-standstill, manually put its
+            // Rigidbody2D to sleep right now instead of waiting out
+            // Unity's own timeToSleep countdown. This only ever touches
+            // debris we're already tracking here - never a contraption's
+            // welds, wires, or anything gameplay-relevant, so there's no
+            // repeat of the stretchy-joint issue from touching the global
+            // sleep threshold earlier this session.
+            //
+            // Visibility is computed once per item in this same pass and
+            // reused below for the off-screen-first cleanup priority too,
+            // so we're not checking the same thing twice per debris piece
+            // per cycle.
+            List<DebrisComponent> pool = new List<DebrisComponent>(tracked);
+            Dictionary<DebrisComponent, bool> visibility = new Dictionary<DebrisComponent, bool>(pool.Count);
+
+            foreach (DebrisComponent d in pool)
+            {
+                bool visible = IsVisible(d, out Renderer r, out Rigidbody2D rb);
+                visibility[d] = visible;
+
+                if (r != null && r.enabled != visible)
+                {
+                    r.enabled = visible;
+                }
+
+                if (!visible && rb != null && !rb.IsSleeping()
+                    && rb.velocity.sqrMagnitude < SleepVelocityThreshold * SleepVelocityThreshold)
+                {
+                    rb.Sleep();
+                }
+            }
+
             int liveCount = tracked.Count;
             int activeCap = Mathf.RoundToInt(Mathf.Lerp(MaxDebrisPieces, MaxDebrisPiecesStrained, AutoOptimizer.StrainLevel));
             if (liveCount <= activeCap)
@@ -361,20 +416,6 @@ namespace PPGPerformanceSuite
             // an older piece that's currently out of frame. Falls back to
             // oldest-first among visible pieces if everything queued is
             // actually on-screen.
-            //
-            // Visibility is computed ONCE per item here rather than inside
-            // the sort comparison itself - Sort() calls the comparison
-            // O(n log n) times, so without caching, the same object's
-            // GetComponent<Renderer>() would get looked up repeatedly for
-            // no reason. One pass to build the lookup, then the sort just
-            // reads from it.
-            List<DebrisComponent> pool = new List<DebrisComponent>(tracked);
-            Dictionary<DebrisComponent, bool> visibility = new Dictionary<DebrisComponent, bool>(pool.Count);
-            foreach (DebrisComponent d in pool)
-            {
-                visibility[d] = IsVisible(d);
-            }
-
             pool.Sort((a, b) =>
             {
                 bool aVisible = visibility[a];
@@ -407,14 +448,20 @@ namespace PPGPerformanceSuite
             }
         }
 
-        private static bool IsVisible(DebrisComponent d)
+        private static bool IsVisible(DebrisComponent d, out Renderer renderer, out Rigidbody2D rigidbody)
         {
+            renderer = null;
+            rigidbody = null;
+
             if (d == null)
             {
                 return false;
             }
-            Renderer r = d.GetComponent<Renderer>();
-            return r != null && r.isVisible;
+
+            renderer = d.GetComponent<Renderer>();
+            rigidbody = d.GetComponent<Rigidbody2D>();
+
+            return renderer != null && renderer.isVisible;
         }
 
         // Swaps an expensive PolygonCollider2D for a cheap CircleCollider2D
@@ -757,6 +804,94 @@ namespace PPGPerformanceSuite
             if (target.enabled != visible)
             {
                 target.enabled = visible;
+            }
+        }
+    }
+
+    // EXPERIMENTAL. Extends the same "put idle things to sleep early"
+    // logic from DebrisLimiter to EVERY rigidbody in the scene, including
+    // jointed/welded contraption parts this time - previously we
+    // deliberately excluded anything with a joint, specifically to avoid
+    // repeating the Red Sky stretchy-weld issue. This is a direct test of
+    // the theory that the stretchiness is actually inherent to how Red
+    // Sky's own "Rigid" wires are built (DistanceJoint2D trusses under
+    // heavy turret mass needing full solver convergence), not something
+    // caused by sleep timing - if that's right, this should be safe even
+    // on jointed structures. If it's wrong, revert is one line in Main().
+    //
+    // Requires SEVERAL consecutive checks of near-zero velocity (not just
+    // one instant reading) before sleeping anything, specifically because
+    // a heavy truss still actively converging under load could briefly
+    // show near-zero velocity between solver steps without actually being
+    // settled yet - a single low reading isn't enough evidence on its own.
+    public class IdleRigidbodySleeper : MonoBehaviour
+    {
+        private const float ScanInterval = 0.5f;
+        private const float VelocityThreshold = 0.03f;
+        private const int RequiredConsecutiveIdleChecks = 4; // ~2 seconds of sustained stillness
+
+        private readonly Dictionary<Rigidbody2D, int> idleStreaks = new Dictionary<Rigidbody2D, int>();
+        private float timer;
+
+        private void Update()
+        {
+            timer += Time.deltaTime;
+            if (timer < ScanInterval)
+            {
+                return;
+            }
+            timer = 0f;
+
+            Rigidbody2D[] allBodies = Object.FindObjectsOfType<Rigidbody2D>();
+            HashSet<Rigidbody2D> stillPresent = new HashSet<Rigidbody2D>();
+
+            foreach (Rigidbody2D rb in allBodies)
+            {
+                if (rb == null || rb.IsSleeping() || rb.bodyType != RigidbodyType2D.Dynamic)
+                {
+                    continue;
+                }
+
+                stillPresent.Add(rb);
+
+                bool nearlyStill = rb.velocity.sqrMagnitude < VelocityThreshold * VelocityThreshold
+                    && Mathf.Abs(rb.angularVelocity) < VelocityThreshold * 10f;
+
+                if (!nearlyStill)
+                {
+                    idleStreaks[rb] = 0;
+                    continue;
+                }
+
+                int streak = idleStreaks.TryGetValue(rb, out int s) ? s + 1 : 1;
+                idleStreaks[rb] = streak;
+
+                if (streak >= RequiredConsecutiveIdleChecks)
+                {
+                    rb.Sleep();
+                }
+            }
+
+            // Clean up tracking entries for bodies that got destroyed or
+            // went to sleep on their own since the last scan, so this
+            // dictionary doesn't grow unbounded over a long session.
+            if (idleStreaks.Count > stillPresent.Count)
+            {
+                List<Rigidbody2D> stale = null;
+                foreach (Rigidbody2D rb in idleStreaks.Keys)
+                {
+                    if (!stillPresent.Contains(rb))
+                    {
+                        (stale ??= new List<Rigidbody2D>()).Add(rb);
+                    }
+                }
+                if (stale != null)
+                {
+                    foreach (Rigidbody2D rb in stale)
+                    {
+                        idleStreaks.Remove(rb);
+                    }
+                }
             }
         }
     }
