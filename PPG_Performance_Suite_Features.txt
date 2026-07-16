@@ -1,0 +1,167 @@
+PPG PERFORMANCE SUITE - FULL FEATURE LIST
+==========================================
+
+AUTO OPTIMIZER (core system)
+-----------------------------
+- Watches real FPS on a smoothed 2-second rolling average
+- Exposes a continuous 0-1 "strain" value instead of an on/off switch
+  - Fully relaxed (0) at 65 FPS or above
+  - MAX STRAIN (1) at 30 FPS or below
+  - Smoothly interpolated in between, eased rather than snapped
+- Small bottom-corner notification fires once when it actually kicks in
+  ("Auto Optimizer active") and once when it relaxes back to normal
+- Every system below reads this same shared strain value, so everything
+  scales together on the same curve
+
+VISUAL SETTINGS AUTO-SCALING (AutoOptimizerVisualLock)
+--------------------------------------------------------
+- Ties the game's own built-in video settings to the strain curve
+- Escalates from least to most disruptive as strain climbs:
+  1. Fancy Effects off
+  2. Bloom off
+  3. Render Scale gradually softens (never below 0.75)
+  4. Decals off
+  5. Bullet Tracers off (true last resort only, real bullet travel time
+     change, only touched at near-total MAX STRAIN)
+- Lighting is never touched (barely affects performance)
+- Settings are "locked" while the mod is active - manual changes in the
+  settings menu revert within about half a second
+- Captures the player's own baseline once on load and always protects
+  that baseline, never overrides upward past what the player chose
+- On quit or mod shutdown, force-restores every setting back to the true
+  baseline so nothing ever gets permanently written to the real
+  config.json in a degraded state
+- One-time recovery popup: if settings look suspiciously degraded on
+  first load (e.g. from an older buggy version), offers a clear choice
+  to reset to the game's real defaults or keep current settings as-is -
+  never silently overwrites anything
+
+DEBRIS CLEANUP (DebrisLimiter)
+--------------------------------
+- Tracks all shatter/debris fragments in the scene
+- Cap scales with strain (120 pieces relaxed, down to 60 at MAX STRAIN)
+- Off-screen-first cleanup priority: removes pieces nobody can see
+  before removing ones currently in view
+- Off-screen debris gets its renderer fully disabled (real GPU savings,
+  zero visible pop when it comes back into view)
+- Off-screen + nearly-still debris gets manually put to sleep early
+  instead of waiting on the default timer
+- Collider simplification: large debris (above ~0.4 units) swaps its
+  expensive PolygonCollider2D for a cheap BoxCollider2D
+  - Small debris is left with its original polygon collider (avoids
+    visible hovering/mismatch on tiny irregular pieces)
+  - Box chosen over circle specifically so debris rests flat instead of
+    rolling away
+- All cleanup goes through SafeDestroy (see below) to avoid corrupting
+  the game's own undo history
+
+DECAL CLEANUP (DecalLimiter)
+-------------------------------
+- Caps blood/scorch/impact decals per surface (150 relaxed, down to 75
+  at MAX STRAIN)
+- Off-screen-first cleanup priority, same reasoning as debris
+- Visibility precomputed once per scan cycle to avoid redundant lookups
+- Goes through SafeDestroy
+
+CORPSE CLEANUP (CorpseLimiter)
+----------------------------------
+- Fully event-driven via the game's own death event - no scanning needed
+- Caps total corpses (60 relaxed, down to 30 at MAX STRAIN)
+- Oldest corpses removed first once the cap is crossed
+- Goes through SafeDestroy
+
+IDLE RIGIDBODY SLEEPER
+-------------------------
+- Extends early-sleep logic to every rigidbody in the scene, including
+  jointed/welded contraption parts (not just loose debris)
+- Requires several consecutive near-zero velocity readings before
+  sleeping anything, so a heavy structure still actively settling under
+  load never gets frozen mid-convergence
+- Excludes anything belonging to a live human entirely - waking a slept
+  ragdoll limb mid-impact was causing exaggerated crush/break behavior
+- Tested specifically on heavy multi-ton welded structures and confirmed
+  safe with no stretchy/bouncy side effects
+
+SMART BULLET COLLISION
+--------------------------
+- Every bullet starts on cheap collision detection the moment it's fired
+- Upgrades to expensive precise collision only when something hittable
+  is actually nearby
+- Range, damage, and speed are completely untouched
+- Bullets still hit off-screen targets normally - this has nothing to do
+  with visibility, purely proximity-based
+
+OFF-SCREEN VISUAL CULLING
+-----------------------------
+- Bleeding particle effects pause their per-frame simulation while the
+  wound is off-screen, resume instantly the moment it's visible again
+- Fire mesh generation (regenerated every frame for the flicker
+  animation) does the same - pauses off-screen, resumes on-screen
+- Burn damage/spread and actual bleeding/health logic are untouched
+  either way - purely visual effects being paused
+
+POOL BOOSTER
+---------------
+- Raises the game's built-in object pool sizes (tracers, muzzle flashes,
+  etc.) once on load
+- Fixes tracers/effects silently disappearing during heavy sustained fire
+
+SPAWN STRUCTURE CACHE
+-------------------------
+- Session-long cache keyed by item type
+- First spawn of a given item type pays full cost checking for guns,
+  bleeding, fire, and circulation systems, and remembers what it found
+- Every later spawn of that same item type skips searches already
+  confirmed empty
+- Gets faster the longer you play, memory-only, resets clean on restart
+
+INCREMENTAL GARBAGE COLLECTION
+----------------------------------
+- Enables Unity's incremental GC mode
+- Spreads memory cleanup work across many frames instead of one big
+  pause, softening allocation-driven stutter
+
+VELOCITY ITERATION TUNER
+----------------------------
+- Auto-adjusts physics velocity iterations along the strain curve
+- Deliberately never touches position iterations - that's the setting
+  that caused visible weld softness/stretch when experimented with
+  earlier, so it's left completely alone
+
+AUDIO SAFETY NET
+--------------------
+- Rare last-resort system, does nothing under normal play
+- Only mutes a sound if BOTH an extreme simultaneous sound count is
+  exceeded (100+) AND that specific sound's source is off-screen
+- Mutes rather than stops, fully reversible, no audio cutoff
+
+UNDO HISTORY PROTECTION (SafeDestroy)
+------------------------------------------
+- Every cleanup system (debris, decals, corpses) properly deregisters
+  from the game's own undo history before destroying anything
+- Fixes a bug where pressing undo (Z) after cleanup could delete the
+  wrong object due to a desynced undo stack
+
+CIRCULATION REPAIR
+----------------------
+- Detects and repairs an old save-corruption issue from a previous mod
+  version where blood circulation could get stuck disabled on certain
+  limbs - forces it back on for anything that spawns
+
+FIRST-LOAD EXPERIENCE
+--------------------------
+- One-time welcome popup explaining Auto Optimizer and the mod's
+  behavior, with a "Never Show Again" option that persists across
+  restarts
+- One-time recovery prompt (see Visual Settings section above) for
+  anyone affected by the old settings-corruption bug
+
+GENERAL PHILOSOPHY
+-----------------------
+- No changes to damage, range, speed, or any gameplay value - only
+  changes to HOW the engine computes things
+- Nothing is ever permanent or invisible - every automatic change is
+  either reversible, protected by a baseline, or clearly communicated
+- Toggling the mod off in the in-game menu takes effect after a full
+  game restart (a People Playground limitation, not specific to this
+  mod)

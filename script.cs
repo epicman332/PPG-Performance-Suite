@@ -50,6 +50,7 @@ namespace PPGPerformanceSuite
             // restart the game to fully revert - nothing else in the
             // suite depends on this.
             bootstrap.AddComponent<IdleRigidbodySleeper>();
+            bootstrap.AddComponent<SettingsMenuNoteInjector>();
 
             ModAPI.Notify("PPG Performance Suite loaded");
         }
@@ -231,6 +232,33 @@ namespace PPGPerformanceSuite
     // Not worth the risk versus the FPS gain. If revisited, it would need
     // PP to expose a real unload hook first.
 
+    // BUG FIX: PP's undo system (UndoControllerBehaviour) tracks actions in
+    // a positional list. When something we destroy directly was originally
+    // spawned through the normal flow, it can still have a stale entry
+    // sitting in that list - pressing undo afterward steps to the wrong
+    // position (reported as "undo deletes the object before the last one").
+    // The game exposes exactly the right API for this: find any action
+    // related to the object, deregister it, THEN destroy. Every cleanup
+    // system in this mod should go through this instead of calling
+    // Object.Destroy directly.
+    public static class SafeDestroy
+    {
+        public static void Do(GameObject go)
+        {
+            if (go == null)
+            {
+                return;
+            }
+
+            if (UndoControllerBehaviour.FindRelevantAction(go, out IUndoableAction action))
+            {
+                UndoControllerBehaviour.DeregisterAction(action);
+            }
+
+            Object.Destroy(go);
+        }
+    }
+
     // The shared "Auto Optimizer" system. One central FPS monitor that other
     // pieces (debris, decals, corpses) check in on, instead of each one
     // tracking FPS separately. Exposes a smooth 0-1 StrainLevel instead of
@@ -244,7 +272,16 @@ namespace PPGPerformanceSuite
     // active gameplay.
     public class AutoOptimizer : MonoBehaviour
     {
-        private const float FullNormalFps = 65f;  // at or above this, StrainLevel = 0 (fully relaxed)
+        // BUG FIX: was 65f. Most players on a standard 60Hz monitor don't
+        // perceive anything in the 50-65 range as "laggy" at all - it's a
+        // genuinely valid subjective experience, not a bug in their
+        // perception. The old threshold meant even a brief dip to the low
+        // 50s could start visibly degrading things (Fancy Effects off
+        // within seconds) despite the player feeling completely smooth.
+        // Lowering this gives real headroom before ANY visual change
+        // happens - strain now only starts building once FPS is low
+        // enough that most people would actually notice something's off.
+        private const float FullNormalFps = 50f;  // at or above this, StrainLevel = 0 (fully relaxed)
         private const float MaxStrainFps = 30f;   // at or below this, StrainLevel = 1 (MAX STRAIN)
         private const float SampleWindow = 2f;
         private const float SmoothingRate = 0.5f; // how much the exposed value moves toward target each window
@@ -256,6 +293,11 @@ namespace PPGPerformanceSuite
         private const float ActiveNotifyThreshold = 0.05f;
 
         public static float StrainLevel { get; private set; }
+
+        // Exposed for AutoVelocityIterationTuner, which scales physics
+        // iterations UP above this same "relaxed" threshold, not just
+        // down below it. Smoothed the same way StrainLevel is.
+        public static float SmoothedFps { get; private set; }
 
         private float rollingTime;
         private int rollingFrames;
@@ -274,6 +316,8 @@ namespace PPGPerformanceSuite
             float avgFps = rollingFrames / rollingTime;
             rollingTime = 0f;
             rollingFrames = 0;
+
+            SmoothedFps = Mathf.Lerp(SmoothedFps, avgFps, SmoothingRate);
 
             // 0 at FullNormalFps or above, 1 at MaxStrainFps or below,
             // smoothly interpolated in between.
@@ -433,7 +477,7 @@ namespace PPGPerformanceSuite
                 if (toRemove != null)
                 {
                     trackedSet.Remove(toRemove);
-                    Destroy(toRemove.gameObject);
+                    SafeDestroy.Do(toRemove.gameObject);
                 }
             }
 
@@ -464,12 +508,28 @@ namespace PPGPerformanceSuite
             return renderer != null && renderer.isVisible;
         }
 
-        // Swaps an expensive PolygonCollider2D for a cheap CircleCollider2D
-        // sized to roughly match, only on debris. Rigidbody2D is untouched
-        // so physics behavior (mass, drag, gravity) stays identical - only
-        // the collision SHAPE gets simplified. The circle is sized to the
-        // polygon's bounds so it still collides in roughly the right place,
-        // it's just not pixel-perfect anymore, which is fine for rubble.
+        // Swaps an expensive PolygonCollider2D for a cheap BoxCollider2D
+        // sized to roughly match, only on debris large enough for it to
+        // matter. Rigidbody2D is untouched so physics behavior (mass,
+        // drag, gravity) stays identical - only the collision SHAPE gets
+        // simplified. The box is sized to the polygon's bounds so it still
+        // collides in roughly the right place, it's just not pixel-perfect
+        // anymore, which is fine for rubble.
+        // BUG FIX: originally used CircleCollider2D, but a perfect circle
+        // has no flat resting face, so debris kept rolling away instead of
+        // settling like the original chunky shape would have. A box has
+        // flat edges to actually rest on and is nearly as cheap.
+        // BUG FIX: a bounding box around a small, jagged, irregular shape
+        // can be noticeably bigger than the actual visible sprite, and
+        // that gap becomes a much bigger percentage of the object's own
+        // size the smaller it is - this made tiny debris visibly hover
+        // above surfaces instead of resting flush. Small polygons are
+        // already cheap to simulate as-is (few vertices), so there's
+        // barely any performance upside to touching them anyway - only
+        // simplifying debris above a minimum size avoids the mismatch
+        // entirely for the pieces where it would actually be noticeable.
+        private const float MinSizeToSimplify = 0.4f;
+
         private static void SimplifyColliderIfPolygon(GameObject go)
         {
             PolygonCollider2D poly = go.GetComponent<PolygonCollider2D>();
@@ -479,19 +539,31 @@ namespace PPGPerformanceSuite
             }
 
             Bounds bounds = poly.bounds;
+            Vector2 size = bounds.size;
+
+            if (Mathf.Max(size.x, size.y) < MinSizeToSimplify)
+            {
+                return;
+            }
+
             Vector2 localCenter = poly.offset;
-            float radius = Mathf.Max(bounds.extents.x, bounds.extents.y);
 
             bool wasTrigger = poly.isTrigger;
             PhysicsMaterial2D material = poly.sharedMaterial;
 
-            Destroy(poly);
+            // Object.Destroy() defers actual removal to the end of the
+            // frame, so the old and new colliders could both technically
+            // be active on the same object for one physics step -
+            // DestroyImmediate guarantees the old one is truly gone first.
+            // Safe here since this runs in a normal Update(), not inside a
+            // physics callback.
+            Object.DestroyImmediate(poly);
 
-            CircleCollider2D circle = go.AddComponent<CircleCollider2D>();
-            circle.offset = localCenter;
-            circle.radius = radius;
-            circle.isTrigger = wasTrigger;
-            circle.sharedMaterial = material;
+            BoxCollider2D box = go.AddComponent<BoxCollider2D>();
+            box.offset = localCenter;
+            box.size = size;
+            box.isTrigger = wasTrigger;
+            box.sharedMaterial = material;
         }
     }
 
@@ -536,7 +608,7 @@ namespace PPGPerformanceSuite
                 PersonBehaviour oldest = tracked.Dequeue();
                 if (oldest != null)
                 {
-                    Object.Destroy(oldest.gameObject);
+                    SafeDestroy.Do(oldest.gameObject);
                 }
             }
         }
@@ -628,7 +700,7 @@ namespace PPGPerformanceSuite
                     Transform child = holder.GetChild(idx);
                     if (child != null)
                     {
-                        Destroy(child.gameObject);
+                        SafeDestroy.Do(child.gameObject);
                     }
                     if (idx < dc.localDecalPositions.Count)
                     {
@@ -852,6 +924,19 @@ namespace PPGPerformanceSuite
                     continue;
                 }
 
+                // BUG FIX: excluding anything belonging to a live human.
+                // Ragdoll limbs are joint-dense and delicate - waking a
+                // slept limb right as it takes an impact can produce a
+                // much harsher "cold" collision response than a body
+                // that was continuously simulated the whole time, which
+                // showed up as humans crushing/breaking bones far too
+                // easily. Corpses are handled separately by CorpseLimiter
+                // anyway, so nothing about human ragdolls needs this.
+                if (rb.GetComponentInParent<PersonBehaviour>() != null)
+                {
+                    continue;
+                }
+
                 stillPresent.Add(rb);
 
                 bool nearlyStill = rb.velocity.sqrMagnitude < VelocityThreshold * VelocityThreshold
@@ -906,13 +991,23 @@ namespace PPGPerformanceSuite
     // fast-moving free bodies feel settling down), which is a lot less
     // likely to cause visible joint softness on welded builds.
     //
-    // Reads AutoOptimizer.StrainLevel (already smoothed + eased) and lerps
-    // between the game's real starting value (0 strain) and a safe floor
-    // (full MAX STRAIN), so it eases in and out gradually along with
-    // everything else instead of jumping in fixed steps.
+    // Scales in BOTH directions now. Below AutoOptimizer's relaxed
+    // threshold, reads StrainLevel and lerps down toward a safe floor,
+    // same as before. Above that same threshold, reads SmoothedFps
+    // directly and scales UP toward a higher ceiling as performance heads
+    // into genuinely excellent territory (120+ fps), capped at 128. This
+    // is a different category from the visual settings lock: physics
+    // iteration count isn't an aesthetic choice the way Bloom is, it's a
+    // pure accuracy/performance dial - more accuracy when there's
+    // headroom to spare is one-directionally desirable, nobody's upset
+    // their joints got MORE stable. Never scales up past whatever the
+    // player's own baseline already was if that baseline is already
+    // above the ceiling.
     public class AutoVelocityIterationTuner : MonoBehaviour
     {
-        private const int MinIterations = 5; // never go lower than this, even at MAX STRAIN
+        private const int MinIterations = 5;   // never go lower than this, even at MAX STRAIN
+        private const int MaxIterations = 128; // ceiling for the upward scaling, reached at UpscaleCeilingFps
+        private const float UpscaleCeilingFps = 120f; // fps at which iterations hit MaxIterations
 
         private int defaultIterations;
 
@@ -923,7 +1018,21 @@ namespace PPGPerformanceSuite
 
         private void Update()
         {
-            int target = Mathf.RoundToInt(Mathf.Lerp(defaultIterations, MinIterations, AutoOptimizer.StrainLevel));
+            int target;
+
+            if (AutoOptimizer.StrainLevel > 0f)
+            {
+                target = Mathf.RoundToInt(Mathf.Lerp(defaultIterations, MinIterations, AutoOptimizer.StrainLevel));
+            }
+            else
+            {
+                // Never lerps below defaultIterations even if someone's
+                // own baseline preference already exceeds MaxIterations -
+                // this branch only ever increases, never decreases.
+                float ceiling = Mathf.Max(defaultIterations, MaxIterations);
+                float t = Mathf.InverseLerp(50f, UpscaleCeilingFps, AutoOptimizer.SmoothedFps);
+                target = Mathf.RoundToInt(Mathf.Lerp(defaultIterations, ceiling, t));
+            }
 
             if (Physics2D.velocityIterations != target)
             {
@@ -956,8 +1065,19 @@ namespace PPGPerformanceSuite
         private const float CheckInterval = 0.5f;
 
         // Strain thresholds, escalating from least to most disruptive.
-        private const float BloomOffThreshold = 0.25f;
-        private const float FancyEffectsOffThreshold = 0.5f;
+        // BUG FIX: Bloom used to be first in line at 0.25, but neon/glow
+        // effects depend entirely on it - going colorless too easily was
+        // a bigger visible hit than the modest performance gain justified.
+        // Fancy Effects goes first now instead, Bloom pushed back later.
+        //
+        // Distant Sound Effects added after finding the game's own tooltip
+        // confirms it: "Disabling this setting makes audio processing a
+        // bit less demanding." A real, sanctioned audio cost with zero
+        // visual impact, so it goes first in line - even less disruptive
+        // than Fancy Effects.
+        private const float DistantSoundOffThreshold = 0.15f;
+        private const float FancyEffectsOffThreshold = 0.25f;
+        private const float BloomOffThreshold = 0.55f;
         private const float RenderScaleThreshold = 0.6f; // starts softening resolution here
         private const float DecalsOffThreshold = 0.75f;
         private const float TracersOffThreshold = 0.95f; // last resort only, near true MAX STRAIN
@@ -968,9 +1088,24 @@ namespace PPGPerformanceSuite
         private bool baselineFancyEffects;
         private bool baselineDecals;
         private bool baselineTracers;
+        private bool baselineDistantSound;
         private float baselineRenderScale;
 
         private float timer;
+
+        // A previous version of this mod could permanently corrupt these
+        // exact 4 settings for someone if they quit while strain was
+        // elevated (fixed above via OnApplicationQuit/OnDestroy, but that
+        // only prevents FUTURE corruption). Anyone already affected has
+        // these degraded values baked into their real config.json, and
+        // this mod has no way to know what they actually had before the
+        // bug hit them - there's no backup, no history. Rather than guess,
+        // this checks once on first load after updating whether things
+        // look suspiciously degraded compared to the game's real defaults,
+        // and if so, offers a one-time choice instead of silently
+        // overwriting anything: reset to the game's actual defaults, or
+        // keep things exactly as they currently are.
+        private const string RecoveryPromptShownKey = "PPGPerformanceSuite_RecoveryPromptShown";
 
         private void Start()
         {
@@ -979,7 +1114,131 @@ namespace PPGPerformanceSuite
             baselineFancyEffects = prefs.FancyEffects;
             baselineDecals = prefs.Decals;
             baselineTracers = prefs.TracerBullets;
+            baselineDistantSound = prefs.DistantSoundEffects;
             baselineRenderScale = prefs.RenderScale;
+
+            if (PlayerPrefs.GetInt(RecoveryPromptShownKey, 0) == 0)
+            {
+                bool looksAffected = baselineBloom == BloomMode.Off
+                    || !baselineFancyEffects
+                    || !baselineDecals
+                    || baselineRenderScale < 1f;
+
+                if (looksAffected)
+                {
+                    StartCoroutine(ShowRecoveryPromptWhenReady());
+                }
+                else
+                {
+                    PlayerPrefs.SetInt(RecoveryPromptShownKey, 1);
+                    PlayerPrefs.Save();
+                }
+            }
+        }
+
+        private System.Collections.IEnumerator ShowRecoveryPromptWhenReady()
+        {
+            float waited = 0f;
+            while (DialogBoxManager.Main == null && waited < 10f)
+            {
+                waited += Time.unscaledDeltaTime;
+                yield return null;
+            }
+
+            PlayerPrefs.SetInt(RecoveryPromptShownKey, 1);
+            PlayerPrefs.Save();
+
+            if (DialogBoxManager.Main == null)
+            {
+                yield break;
+            }
+
+            string message =
+                "A few of your video settings (Bloom, Fancy Effects, Decals, " +
+                "or Render Scale) look lower than the game's defaults.\n\n" +
+                "An older version of this mod had a bug that could permanently " +
+                "lower these if the game closed at the wrong moment. That's " +
+                "since been fixed, but this mod can't tell whether your current " +
+                "values are from that old bug or just how you actually like " +
+                "things.\n\n" +
+                "Want to reset these 4 settings to the game's defaults? " +
+                "Nothing will be changed unless you choose to.";
+
+            DialogBox dialog = DialogBoxManager.Dialog(
+                message,
+                new DialogButton("Keep My Current Settings", true),
+                new DialogButton("Reset to Defaults", true, () =>
+                {
+                    Preferences p = UserPreferenceManager.Current;
+                    p.BloomMode = BloomMode.Fancy;
+                    p.FancyEffects = true;
+                    p.Decals = true;
+                    p.RenderScale = 1f;
+
+                    baselineBloom = p.BloomMode;
+                    baselineFancyEffects = p.FancyEffects;
+                    baselineDecals = p.Decals;
+                    baselineRenderScale = p.RenderScale;
+                })
+            );
+
+            if (dialog != null)
+            {
+                UnityEngine.UI.ContentSizeFitter fitter = dialog.TextMesh.GetComponent<UnityEngine.UI.ContentSizeFitter>();
+                if (fitter != null)
+                {
+                    fitter.horizontalFit = UnityEngine.UI.ContentSizeFitter.FitMode.Unconstrained;
+                }
+
+                UnityEngine.UI.ContentSizeFitter parentFitter = dialog.GetComponentInParent<UnityEngine.UI.ContentSizeFitter>();
+                if (parentFitter != null)
+                {
+                    parentFitter.horizontalFit = UnityEngine.UI.ContentSizeFitter.FitMode.Unconstrained;
+                }
+
+                RectTransform textRect = dialog.TextMesh.rectTransform;
+                textRect.sizeDelta = new Vector2(650f, textRect.sizeDelta.y);
+                dialog.TextMesh.enableWordWrapping = true;
+
+                dialog.SetWidth(700f);
+            }
+        }
+
+        // CRITICAL BUG FIX: PP saves these settings to a real config.json
+        // on disk, and calls Save() from several places including on
+        // quit. Without this, whatever strain had temporarily set (Bloom
+        // off, lowered Render Scale, etc.) at the exact moment someone
+        // closed the game would get written as their new PERMANENT
+        // settings, with no way for them to know what their original
+        // values even were. This forces every value back to the real
+        // baseline immediately whenever the game is quitting or this
+        // component is going away for any reason, so whatever gets saved
+        // to disk is always the person's actual chosen settings, never a
+        // temporary strain-driven one.
+        private void OnApplicationQuit()
+        {
+            RestoreBaseline();
+        }
+
+        private void OnDestroy()
+        {
+            RestoreBaseline();
+        }
+
+        private void RestoreBaseline()
+        {
+            Preferences prefs = UserPreferenceManager.Current;
+            if (prefs == null)
+            {
+                return;
+            }
+
+            prefs.BloomMode = baselineBloom;
+            prefs.FancyEffects = baselineFancyEffects;
+            prefs.Decals = baselineDecals;
+            prefs.TracerBullets = baselineTracers;
+            prefs.DistantSoundEffects = baselineDistantSound;
+            prefs.RenderScale = baselineRenderScale;
         }
 
         private void Update()
@@ -998,6 +1257,7 @@ namespace PPGPerformanceSuite
             bool desiredFancyEffects = (strain >= FancyEffectsOffThreshold) ? false : baselineFancyEffects;
             bool desiredDecals = (strain >= DecalsOffThreshold) ? false : baselineDecals;
             bool desiredTracers = (strain >= TracersOffThreshold) ? false : baselineTracers;
+            bool desiredDistantSound = (strain >= DistantSoundOffThreshold) ? false : baselineDistantSound;
 
             // Between RenderScaleThreshold and DecalsOffThreshold, smoothly
             // scale resolution down from the user's own baseline toward
@@ -1028,6 +1288,10 @@ namespace PPGPerformanceSuite
             if (prefs.TracerBullets != desiredTracers)
             {
                 prefs.TracerBullets = desiredTracers;
+            }
+            if (prefs.DistantSoundEffects != desiredDistantSound)
+            {
+                prefs.DistantSoundEffects = desiredDistantSound;
             }
             if (!Mathf.Approximately(prefs.RenderScale, desiredRenderScale))
             {
@@ -1294,6 +1558,68 @@ namespace PPGPerformanceSuite
             if (asset != null)
             {
                 cache[asset] = presence;
+            }
+        }
+    }
+
+    // Adds a small note directly onto the game's own Settings menu, right
+    // where someone would actually try to change one of the 5 settings
+    // Auto Optimizer manages - rather than relying only on the load-time
+    // popup, which they may have already dismissed and forgotten about.
+    // The settings menu is generated fresh from reflection over the
+    // Preferences class (see SettingsGeneratorBehaviour), not from a
+    // static prefab, so this waits for that generation to happen and then
+    // appends to each target setting's existing description text. Runs on
+    // a light ongoing recheck (not just once) so it self-heals if the menu
+    // ever gets regenerated later in the session - never appends twice to
+    // the same one.
+    public class SettingsMenuNoteInjector : MonoBehaviour
+    {
+        private const float ScanInterval = 2f;
+        private const string Note = " (Managed by Auto Optimizer)";
+
+        private static readonly HashSet<string> TargetLabels = new HashSet<string>
+        {
+            "Bloom",
+            "Bullet tracers",
+            "Fancy effects",
+            "Decals",
+            "Render scale",
+            "Distant sound effects"
+        };
+
+        private readonly HashSet<SettingTemplateBehaviour> alreadyPatched = new HashSet<SettingTemplateBehaviour>();
+        private float timer;
+
+        private void Update()
+        {
+            timer += Time.unscaledDeltaTime;
+            if (timer < ScanInterval)
+            {
+                return;
+            }
+            timer = 0f;
+
+            SettingTemplateBehaviour[] settings = Object.FindObjectsOfType<SettingTemplateBehaviour>(includeInactive: true);
+            foreach (SettingTemplateBehaviour setting in settings)
+            {
+                if (setting == null || alreadyPatched.Contains(setting) || setting.Label == null)
+                {
+                    continue;
+                }
+
+                if (!TargetLabels.Contains(setting.Label.text))
+                {
+                    continue;
+                }
+
+                if (setting.Description != null && !setting.Description.text.Contains(Note))
+                {
+                    setting.Description.gameObject.SetActive(true);
+                    setting.Description.text += Note;
+                }
+
+                alreadyPatched.Add(setting);
             }
         }
     }
